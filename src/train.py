@@ -72,6 +72,12 @@ def opts_parser():
             type=int,default=0,
             help='Flag to determine whether adversarial training should occur'
             'or not.')
+    parser.add_argument('--input_type',type=str,
+            default='mel_spects', 
+            help='input type for model, data and adversarial attacks')
+    parser.add_argument('--model_type',type=str,
+            default='CNN', 
+            help='model architecture choice between CRNN and CNN')
     return parser
 
 def main():
@@ -104,16 +110,28 @@ def main():
     # prepare dataset
     datadir = os.path.join(os.path.dirname(__file__),
                            os.path.pardir, 'datasets', options.dataset)
-
-    dataloader = DatasetLoader(options.dataset, options.cache_spectra, datadir)
-    batches = dataloader.prepare_batches(sample_rate, frame_len, fps,
+    
+    meanstd_file = os.path.join(os.path.dirname(__file__),
+                                '%s_meanstd.npz' % options.dataset)
+ 
+    if(options.input_type=='audio'):
+        dataloader = DatasetLoader(options.dataset, options.cache_spectra, datadir, input_type=options.input_type)
+        batches = dataloader.prepare_audio_batches(sample_rate, frame_len, fps, blocklen, batchsize)
+    else:
+        dataloader = DatasetLoader(options.dataset, options.cache_spectra, datadir, input_type=options.input_type)
+        batches = dataloader.prepare_batches(sample_rate, frame_len, fps,
             mel_bands, mel_min, mel_max, blocklen, batchsize)
-    validation_data = DatasetLoader(options.dataset, options.cache_spectra, datadir,
-            dataset_split='valid')
+    
+    validation_data = DatasetLoader(options.dataset, '../ismir2015/experiments/mel_data/', datadir,
+            dataset_split='valid', input_type='mel_spects')
     mel_spects_val, labels_val = validation_data.prepare_batches(sample_rate, frame_len, fps,
-            mel_bands, mel_min, mel_max, blocklen, batchsize)
+            mel_bands, mel_min, mel_max, blocklen, batchsize, batch_data=False)
 
-    mdl = model.CNNModel(False,False)
+
+    mdl = model.CNNModel(model_type=options.model_type, input_type=options.input_type,
+            is_zeromean=False,sample_rate=sample_rate, frame_len=frame_len,
+            fps=fps, mel_bands=mel_bands, mel_min=mel_min, mel_max=mel_max,
+            bin_mel_max=bin_mel_max, meanstd_file=meanstd_file, device=device)
     mdl = mdl.to(device)
     
     #Setting up learning rate and learning rate parameters
@@ -158,22 +176,39 @@ def main():
         # - Start the training for this epoch
         for batch in progress(range(epochsize), min_delay=0.5,desc='Epoch %d/%d: Batch ' % (epoch+1, epochs)):
             data = next(batches)
-            input_data = np.transpose(data[0][:,:,:,np.newaxis],(0,3,1,2))
+            if(options.input_type=='audio' or options.input_type=='stft'):
+                input_data = data[0]
+            else:
+                input_data = np.transpose(data[0][:,:,:,np.newaxis],(0,3,1,2))
             labels = data[1][:,np.newaxis].astype(np.float32)
             
             #map labels to make them softer
-            labels = (0.02 + 0.96*labels)
+            if not options.adversarial_training:
+                labels = (0.02 + 0.96*labels)
             optimizer.zero_grad()
             
             if(options.adversarial_training):
                 mdl.train(False)
-                input_data_adv = attacks.projected_gradient_descent(mdl, torch.from_numpy(input_data).
-                    to(device),cfg['eps'],cfg['eps_iter'],cfg['nb_iter'],cfg['norm'],y=torch.FloatTensor(data[1]).to(device),
-                    rand_init=True).cpu().detach().numpy()
+                if(options.input_type=='stft'):
+                    input_data_adv = attacks.PGD(mdl, torch.from_numpy(input_data).to(device), 
+                        target=torch.from_numpy(labels).to(device),
+                        eps=cfg['eps'], step_size=cfg['eps_iter'], 
+                        iterations=cfg['nb_iter'], use_best=True, random_start=True,
+                        clip_min=0, clip_max=1e8).cpu().detach().numpy()
+                else:
+                    input_data_adv = attacks.PGD(mdl, torch.from_numpy(input_data).to(device), 
+                        target=torch.from_numpy(labels).to(device),
+                        eps=cfg['eps'], step_size=cfg['eps_iter'], 
+                        iterations=cfg['nb_iter'], use_best=True, random_start=True).cpu().detach().numpy()
+                
                 mdl.train(True)
-
-            optimizer.zero_grad()
-            outputs = mdl(torch.from_numpy(input_data_adv).to(device))
+                optimizer.zero_grad()
+                outputs = mdl(torch.from_numpy(input_data_adv).to(device))
+            else:
+                optimizer.zero_grad()
+                outputs = mdl(torch.from_numpy(input_data).to(device))
+            #input(outputs.size())
+            #input(mdl.conv(torch.from_numpy(input_data).to(device)).cpu().detach().numpy().shape) 
             loss = criterion(outputs, torch.from_numpy(labels).to(device))
             loss.backward()
             optimizer.step()
@@ -182,7 +217,7 @@ def main():
    
         # - Compute validation loss and error if desired
         if options.validate:
-            
+            mdl.input_type = 'mel_spects'
             from eval import evaluate
             mdl.train(False) 
             val_loss = 0
@@ -197,23 +232,29 @@ def main():
                 excerpts = np.lib.stride_tricks.as_strided(
                     spect, shape=(num_excerpts, blocklen, spect.shape[1]),
                     strides=(spect.strides[0], spect.strides[0], spect.strides[1]))
-                
                 # - Pass mini-batches through the network and concatenate results
                 for pos in range(0, num_excerpts, batchsize):
                     input_data = np.transpose(excerpts[pos:pos + batchsize,:,:,np.newaxis],(0,3,1,2))
+                    #if (pos+batchsize>num_excerpts):
+                    #    label_batch = label[blocklen//2+pos:blocklen//2+num_excerpts,
+                    #            np.newaxis].astype(np.float32)
+                    #else:
+                    #    label_batch = label[blocklen//2+pos:blocklen//2+pos+batchsize,
+                    #            np.newaxis].astype(np.float32)
                     if (pos+batchsize>num_excerpts):
-                        label_batch = label[blocklen//2+pos:blocklen//2+num_excerpts,
-                                np.newaxis].astype(np.float32)
+                        label_batch = label[pos:num_excerpts,
+                               np.newaxis].astype(np.float32)
                     else:
-                        label_batch = label[blocklen//2+pos:blocklen//2+pos+batchsize,
+                        label_batch = label[pos:pos+batchsize,
                                 np.newaxis].astype(np.float32)
+                    
                     pred = mdl(torch.from_numpy(input_data).to(device))
                     e = criterion(pred,torch.from_numpy(label_batch).to(device))
                     preds = np.append(preds,pred[:,0].cpu().detach().numpy())
                     labs = np.append(labs,label_batch)
                     val_loss +=e.item()
                     num_iter+=1
-
+            mdl.input_type = options.input_type
             print("Validation loss: %.3f" % (val_loss / num_iter))
             _, results = evaluate(preds,labs)
             print("Validation error: %.3f" % (1 - results['accuracy']))
