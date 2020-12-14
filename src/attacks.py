@@ -222,10 +222,9 @@ def projected_gradient_descent(model_fn, x, eps, eps_iter, nb_iter, norm,
         #    y = torch.Tensor([1]).unsqueeze(0)
         #else:
         #    y = torch.Tensor([0]).unsqueeze(0)
-        #y = y.to(device)
-
-
+        #y = y.to(device
     #    _, y = torch.max(model_fn(x), 1)
+
   i = 0
   while i < nb_iter:
     adv_x = fast_gradient_method(model_fn, adv_x, eps_iter, norm,
@@ -253,37 +252,140 @@ def projected_gradient_descent(model_fn, x, eps, eps_iter, nb_iter, norm,
   return adv_x
 
 
-def deep_representations(model_fn, x_source, x_target, eps, eps_iter, nb_iter, norm,
-        clip_min=None, clip_max=None): 
-  
-    #optimizer = torch.optim.SGD({x}, lr=0.5,momentum=0.9)
-    #delta = torch.zeros(x_source.size, dtype=torch.float, requires_grad=False)
-    #optimizer = torch.optim.LBFGS({x_source})
-    x_orig = x_source
-    for i in range(nb_iter):
-        #optimizer.zero_grad()
-        x_source = x_source.clone().detach().to(torch.float).requires_grad_(True)
-        
-        loss = torch.div(torch.norm(model_fn(x_source)-model_fn(x_target), dim=1), torch.norm(model_fn(x_target), dim=1))
-        loss.backward()
-        l = len(x_source.shape) - 1
-        g = x_source.grad
-        x_source.grad.zero_()
-        #g_norm = torch.norm(g.view(g.shape[0], -1), dim=1).view(-1, *([1]*l))
-        #scaled_g = g / (g_norm + 1e-10)
-        #x_source = x_source + scaled_g * eps_iter
-        optimal_perturbation = optimize_linear(g, eps, norm)
-        x_source = x_source + optimal_perturbation
-        print(eps, norm, optimal_perturbation)
-        input('Wait')
-        #loss_feat = loss_fn(model_fn(x_source),model_fn(x_target))
-        #loss_input = loss_fn(x_source,x_orig)
-        #print(loss_feat, loss_input)
-        #loss = 100*loss_feat + loss_input
-        #loss.backward()
-        #optimizer.step(loss.backward())
-        #optimal_perturbation = optimize_linear(x.grad,1e-3,2)
-        #x = x+optimal_perturbation
-        #x_source = x_source - x_source.grad * 0.01
+def l2project(x, orig_input, eps):
+    diff = x - orig_input
+    diff = diff.renorm(p=2, dim=0, maxnorm=eps)
+    return orig_input + diff
 
-    return x_source
+def l2step(x, g, step_size):
+    l = len(x.shape) - 1
+    g_norm = torch.norm(g.view(g.shape[0], -1), dim=1).view(-1, *([1]*l))
+    scaled_g = g / (g_norm +1e-10)
+    return x +scaled_g * step_size
+
+def l2random_perturb(x, eps):
+    l = len(x.shape) - 1
+    rp = torch.rand_like(x)
+    rp_norm = rp.view(rp.shape[0], -1).norm(dim=1).view(-1, *([1]*l))
+    return x + eps*rp/(rp_norm+1e-10)
+    
+
+
+def PGD(model_fn, x, target, eps, step_size, iterations,
+        random_start=False, random_restarts=False, do_tqdm=False,
+        targeted=False, custom_loss=None,
+        orig_input=None, use_best=True, clip_min=None, clip_max=None):
+
+    """
+    Code adapted from https://github.com/MadryLab/robustness/blob/master/robustness/attacker.py
+    """
+    
+    if orig_input is None: orig_input = x.detach()
+    orig_input = orig_input.cuda()
+
+    m = -1 if targeted else 1
+
+    #criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    criterion = torch.nn.BCELoss(reduction='none')
+    #step_class = STEPS[constraint] if isinstance(constraint, str) else constraint
+    #step = step_class(eps=eps, orig_input=orig_input, step_size=step_size)
+
+    def calc_loss(inp, target):
+        output = model_fn(inp)
+        #print(output, target.size())
+        if custom_loss:
+            return custom_loss(model_fn, inp, target)
+
+        return criterion(output, target), output
+
+    def get_adv_examples(x):
+        #Random start to escape certain types of gradient masking
+        if random_start:
+            x = l2random_perturb(x, eps)
+
+
+        iterator = range(iterations)
+        if do_tqdm: iterator = tqdm(iterator)
+
+        best_loss = None
+        best_x = None
+
+        # A function that updates the best loss and best attack
+        def replace_best(loss, bloss, x, bx):
+            if bloss is None:
+                bx = x.clone().detach()
+                bloss = loss.clone().detach()
+            else:
+                replace = m*bloss < m*loss
+                replace = torch.squeeze(replace)
+                #print(bloss.size(), loss.size(), x.size())
+                #input(replace.size())
+                bx[replace] = x[replace].clone().detach()
+                bloss[replace] = loss[replace]
+                #print(bloss)
+            return bloss, bx
+
+
+        #PGD iterates
+        for _ in iterator:
+            x = x.clone().detach().requires_grad_(True)
+            losses, out = calc_loss(x, target)
+            assert losses.shape[0] == x.shape[0], \
+                    'Shape of losses must match input'
+            
+            #print(losses)
+            loss = torch.mean(losses)
+            #print(loss)
+            #with torch.autograd.detect_anomaly():
+            grad, = torch.autograd.grad(m*loss, [x])
+            with torch.no_grad():
+                args = [losses, best_loss, x, best_x]
+                best_loss, best_x = replace_best(*args) if use_best else (losses, x)
+                x = l2step(x, grad, step_size)
+                x = l2project(x, orig_input, eps)
+                if (clip_min is not None and clip_max is not None):
+                    x = torch.clamp(x, clip_min, clip_max, out=x)
+                    #print(torch.max(x), torch.min(x))
+                    #input('Here')
+                elif(clip_min is not None):
+                    x = torch.clamp(x, clip_min, torch.max(x), out=x)
+                elif(clip_max is not None):
+                    x = torch.clamp(x, torch.min(x), clip_max, out=x)
+                if do_tqdm: iterator.set_description("Current loss: {l}".format(l=loss))
+
+        if not use_best:
+            ret = x.clone().detach()
+            return ret
+
+        losses, _ = calc_loss(x, target)
+        args = [losses, best_loss, x, best_x]
+        best_loss, best_x = replace_best(*args)
+        return best_x
+
+    if random_restarts:
+        to_ret = None
+
+        orig_cpy = x.clone().detach()
+        for _ in range(random_restarts):
+            adv = get_adv_examples(orig_cpy)
+
+            if to_ret is None:
+                to_ret = adv.detach()
+
+            _, output = calc_loss(adv, target)
+            corr, = helpers.accuracy(output, target, topk=(1,), exact=True)
+            corr = corr.byte()
+            misclass = ~corr
+            to_ret[misclass] = adv[misclass]
+
+        adv_ret = to_ret
+
+    else:
+        adv_ret = get_adv_examples(x)
+
+    return adv_ret
+
+
+
+
+
