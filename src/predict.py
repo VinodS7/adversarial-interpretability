@@ -74,8 +74,10 @@ def opts_parser():
             action='append', type=str,
             help='Set the configuration variable KEY to VALUE. Overrides '
             'settings from --vars options. Can be given multiple times') 
-    parser.add_argument('--model_type',default='baseline', type=str,
-            help='Set model type for use')
+    parser.add_argument('--input_type',default='baseline', type=str,
+            help='Input type for model')
+    parser.add_argument('--model_type',default='CNN', type=str,
+            help='Set model architecture for use')
     return parser
 
 def main():
@@ -158,7 +160,6 @@ def main():
         std = f['std']
     mean = mean.astype(floatX)
     istd = np.reciprocal(std).astype(floatX)
-
     # - define generator for Z-scoring
     spects = ((spect - mean) * istd for spect in spects)
 
@@ -168,7 +169,8 @@ def main():
 
     # - we start the generator in a background thread (not required)
 
-    mdl = model.CNNModel(False,False, device=device)
+    mdl = model.CNNModel(model_type=options.model_type,input_type=options.input_type , is_zeromean=False,
+            meanstd_file=meanstd_file)
     mdl.load_state_dict(torch.load(modelfile))
     mdl.to(device)
     mdl.eval()

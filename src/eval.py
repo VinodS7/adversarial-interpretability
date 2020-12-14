@@ -146,12 +146,12 @@ def main():
     options = parser.parse_args()
     infiles = options.infile
     fps = 70
-    print(infiles[0]) 
+    #print(infiles[0]) 
     # load network predictions
     preds = np.load(infiles[0])
 
-    for k in preds.files:
-        print(k)
+    #for k in preds.files:
+    #    print(k)
     if len(infiles) > 1:
         preds = {fn: preds[fn] / len(infiles) for fn in preds.files}
         for infile in infiles[1:]:
@@ -167,7 +167,7 @@ def main():
     with io.open(os.path.join(datadir, 'filelists', 'test')) as f:
         filelist_test = [l.rstrip() for l in f if l.rstrip()]
 
-    [print(np.argmax(preds[fn],1).shape) for fn in filelist_test]
+    #[print(np.argmax(preds[fn],1).shape) for fn in filelist_test]
     # optimize threshold on validation set if needed
     if options.model_type == 'twoclass':
         labels = load_labels(filelist_valid,preds,fps,datadir)
@@ -185,7 +185,7 @@ def main():
         total = 0
         count = 0
         for fn,lab in zip(filelist_test,labels):
-            print(fn,len(lab))
+            #print(fn,len(lab))
             t,results = evaluate_twoclass(np.argmax(preds[fn],1),lab)
             total+=t
             count+=(results['accuracy']*t)
